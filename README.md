@@ -79,12 +79,15 @@ python hsv_yolo_labeler.py --camera 1 --class-id 2 --min-area 1000
 ```text
 dataset/
 ├── data.yaml
-├── images/
-│   ├── train/frame_....jpg
-│   └── val/
-└── labels/
-    ├── train/frame_....txt
-    └── val/
+├── train/
+│   ├── images/frame_....jpg
+│   └── labels/frame_....txt
+├── valid/
+│   ├── images/
+│   └── labels/
+└── test/
+    ├── images/
+    └── labels/
 ```
 
 라벨 한 줄은 YOLO 표준 형식인

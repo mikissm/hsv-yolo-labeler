@@ -145,7 +145,9 @@ class Preview(QLabel):
 class ReviewDialog(QDialog):
     def __init__(self, dataset_dir, class_names, parent=None, initial_class=None):
         super().__init__(parent); self.dataset_dir = dataset_dir; self.class_names = class_names
-        self.all_images = sorted((dataset_dir / "images/train").glob("*")); self.images = self.all_images[:]
+        self.all_images = sorted(image for split in ("train","valid","test")
+                                 for image in (dataset_dir/split/"images").glob("*"))
+        self.images = self.all_images[:]
         self.index = 0; self.filter_class = None
         self.setWindowTitle("YOLO 라벨 검수"); self.resize(1100, 760)
         layout = QVBoxLayout(self); self.info = QLabel(); self.info.setAlignment(Qt.AlignCenter)
@@ -174,7 +176,7 @@ class ReviewDialog(QDialog):
         self.show_current()
 
     def label_path(self, image):
-        return self.dataset_dir / "labels/train" / f"{image.stem}.txt"
+        return image.parent.parent / "labels" / f"{image.stem}.txt"
 
     def read_labels(self, image):
         path = self.label_path(image); result = []
@@ -189,7 +191,7 @@ class ReviewDialog(QDialog):
     def show_current(self):
         if not self.images:
             self.preview.clear(); self.preview.setText("선택한 범위에 해당하는 이미지가 없습니다")
-            self.info.setText("검수할 train 이미지가 없습니다"); return
+            self.info.setText("검수할 이미지가 없습니다"); return
         path = self.images[self.index]; image = cv2.imread(str(path))
         if image is None: return
         height, width = image.shape[:2]; labels = self.read_labels(path)
@@ -603,8 +605,9 @@ class MainWindow(QMainWindow):
         return result
 
     def ensure_dataset(self):
-        for relative in ("images/train", "images/val", "labels/train", "labels/val"):
-            (self.dataset_dir / relative).mkdir(parents=True, exist_ok=True)
+        for split in ("train","valid","test"):
+            for kind in ("images","labels"):
+                (self.dataset_dir/split/kind).mkdir(parents=True,exist_ok=True)
 
     def choose_dataset_folder(self):
         selected = QFileDialog.getExistingDirectory(self, "YOLO 데이터셋 폴더 선택", str(self.dataset_dir),
@@ -677,8 +680,8 @@ class MainWindow(QMainWindow):
         self.refresh_review_table()
 
     def remap_class_ids(self, source, target):
-        for split in ("train","val"):
-            for path in (self.dataset_dir/f"labels/{split}").glob("*.txt"):
+        for split in ("train","valid","test"):
+            for path in (self.dataset_dir/split/"labels").glob("*.txt"):
                 output=[]
                 for line in path.read_text(encoding="utf-8").splitlines():
                     parts=line.split()
@@ -701,7 +704,7 @@ class MainWindow(QMainWindow):
         # Keep the YAML relocatable with the dataset directory. Ultralytics
         # resolves this path relative to data.yaml.
         lines = ["# Ultralytics YOLO11 dataset", "path: .",
-                 "train: images/train", "val: images/val", "test:",
+                 "train: train/images", "val: valid/images", "test: test/images",
                  "", f"nc: {len(escaped)}", "names:"]
         lines.extend(f"  {i}: '{name}'" for i, name in enumerate(escaped))
         path = self.dataset_dir / "data.yaml"
@@ -746,8 +749,8 @@ class MainWindow(QMainWindow):
 
     def class_box_counts(self):
         counts = [0] * len(self.class_names); invalid = 0
-        for split in ("train","val"):
-            for path in (self.dataset_dir/f"labels/{split}").glob("*.txt"):
+        for split in ("train","valid","test"):
+            for path in (self.dataset_dir/split/"labels").glob("*.txt"):
                 for line in path.read_text(encoding="utf-8").splitlines():
                     try: class_id=int(line.split()[0])
                     except (ValueError,IndexError): invalid+=1; continue
@@ -774,7 +777,7 @@ class MainWindow(QMainWindow):
             if not automatic: QMessageBox.warning(self,"저장 실패","저장할 영상이 없습니다")
             return
         self.ensure_dataset(); self.write_data_yaml(silent=True)
-        images, labels = self.dataset_dir/"images/train", self.dataset_dir/"labels/train"
+        images, labels = self.dataset_dir/"train/images", self.dataset_dir/"train/labels"
         stem=datetime.now().strftime("frame_%Y%m%d_%H%M%S_%f")
         image_path, label_path=images/f"{stem}.jpg",labels/f"{stem}.txt"
         cv2.imwrite(str(image_path),self.frame); height,width=self.frame.shape[:2]
