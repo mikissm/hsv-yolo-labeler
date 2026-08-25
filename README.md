@@ -13,6 +13,15 @@ git pull
 
 `run.sh`는 저장소 내부에 `.venv`를 만들고 의존성을 자동 설치합니다. 한글과 공백이 포함된 경로에서도 Qt 플러그인을 찾도록 구성되어 있습니다.
 
+실행 환경을 초기화하거나 완전히 다시 설치하려면:
+
+```bash
+./remove_env.sh
+./run.sh
+```
+
+`remove_env.sh`는 `.venv`, Python 캐시, 임시 Qt 플러그인 링크만 제거합니다. 소스 코드와 데이터셋은 유지됩니다. 확인 질문 없이 실행하려면 `./remove_env.sh --yes`를 사용합니다.
+
 ### Windows
 
 Python 3.10 이상을 설치한 뒤 실행합니다.
@@ -190,5 +199,6 @@ class_id x_center y_center width height
 hsv_yolo_labeler.py  # 애플리케이션
 requirements.txt     # Python 의존성
 run.sh               # Linux 실행기
+remove_env.sh        # Linux 실행 환경 제거
 run.bat              # Windows 실행기
 ```
