@@ -16,4 +16,11 @@ if [[ ! -f "$INSTALL_STAMP" || "$REQUIREMENTS" -nt "$INSTALL_STAMP" ]]; then
   touch "$INSTALL_STAMP"
 fi
 
+QT_PLUGIN_SOURCES=("$VENV_DIR"/lib/python*/site-packages/PyQt5/Qt5/plugins)
+QT_PLUGIN_LINK="${TMPDIR:-/tmp}/hsv_yolo_labeler_qt_plugins_${UID}"
+if [[ -d "${QT_PLUGIN_SOURCES[0]}" ]]; then
+  ln -sfn "$(cd "${QT_PLUGIN_SOURCES[0]}" && pwd)" "$QT_PLUGIN_LINK"
+  export QT_QPA_PLATFORM_PLUGIN_PATH="$QT_PLUGIN_LINK"
+fi
+unset QT_QPA_FONTDIR
 exec "$VENV_DIR/bin/python" hsv_yolo_labeler.py "$@"

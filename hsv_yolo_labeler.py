@@ -4,16 +4,12 @@ from __future__ import annotations
 
 import argparse
 import ast
-import os
 import re
 import sys
 from datetime import datetime
 from pathlib import Path
 
-# opencv-python also bundles Qt plugins. If cv2's plugin directory wins, PyQt5
-# can find xcb but fails to load it. Select PyQt5's own plugin directory before
-# importing cv2 so both pip and system installations work consistently.
-from PyQt5.QtCore import QLibraryInfo, QRectF, Qt, QTimer
+from PyQt5.QtCore import QRectF, Qt, QTimer
 from PyQt5.QtGui import QColor, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (QApplication, QComboBox, QFormLayout, QGroupBox,
     QFileDialog, QDialog, QHBoxLayout, QInputDialog, QLabel, QMainWindow,
@@ -21,15 +17,8 @@ from PyQt5.QtWidgets import (QApplication, QComboBox, QFormLayout, QGroupBox,
     QHeaderView, QScrollArea, QTabWidget, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget)
 
-os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = QLibraryInfo.location(QLibraryInfo.PluginsPath)
-
 import cv2
 import numpy as np
-
-# cv2 resets QT_QPA_PLATFORM_PLUGIN_PATH while it is imported. Restore the
-# PyQt5 path after that import and before QApplication is constructed.
-os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = QLibraryInfo.location(QLibraryInfo.PluginsPath)
-os.environ.pop("QT_QPA_FONTDIR", None)
 
 DEFAULTS = (170, 10, 100, 255, 100, 255, 500, 5)
 
