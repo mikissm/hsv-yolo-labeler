@@ -4,18 +4,22 @@ from __future__ import annotations
 
 import argparse
 import ast
+import math
+import random
 import re
+import shutil
+import uuid
 import sys
 from datetime import datetime
 from pathlib import Path
 
-from PyQt5.QtCore import QRectF, Qt, QTimer
+from PyQt5.QtCore import QPointF, QRectF, Qt, QTimer
 from PyQt5.QtGui import QColor, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (QApplication, QComboBox, QFormLayout, QGroupBox,
     QFileDialog, QDialog, QHBoxLayout, QInputDialog, QLabel, QMainWindow,
     QLineEdit, QMessageBox, QPushButton, QCheckBox, QShortcut, QSlider, QSpinBox,
     QHeaderView, QScrollArea, QTabWidget, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget)
+    QDoubleSpinBox, QProgressDialog, QSizePolicy, QVBoxLayout, QWidget)
 
 import cv2
 import numpy as np
@@ -244,6 +248,147 @@ class DataInfoDialog(QDialog):
         layout.addWidget(table)
 
 
+class BoxCanvas(QWidget):
+    def __init__(self,image,boxes,class_names,selected=0,parent=None):
+        super().__init__(parent); self.image=image; self.boxes=boxes; self.class_names=class_names
+        self.selected=max(0,min(selected,len(boxes)-1)) if boxes else -1; self.drag_corner=None
+        self.setMinimumSize(760,520); self.setMouseTracking(True)
+
+    def transform(self):
+        height,width=self.image.shape[:2]; scale=min(self.width()/width,self.height()/height)
+        return scale,(self.width()-width*scale)/2,(self.height()-height*scale)/2
+
+    def paintEvent(self,_):
+        painter=QPainter(self); painter.fillRect(self.rect(),Qt.black)
+        rgb=cv2.cvtColor(self.image,cv2.COLOR_BGR2RGB); h,w,c=rgb.shape
+        qimage=QImage(rgb.data,w,h,c*w,QImage.Format_RGB888).copy(); scale,ox,oy=self.transform()
+        painter.drawImage(QRectF(ox,oy,w*scale,h*scale),qimage)
+        for index,box in enumerate(self.boxes):
+            _,class_id,x1,y1,x2,y2=box; color=QColor("#00ff66" if index==self.selected else "#ffcc00")
+            rect=QRectF(ox+x1*scale,oy+y1*scale,(x2-x1)*scale,(y2-y1)*scale)
+            painter.setPen(QPen(color,4 if index==self.selected else 2)); painter.drawRect(rect)
+            name=self.class_names[class_id] if 0<=class_id<len(self.class_names) else str(class_id)
+            painter.drawText(rect.topLeft()+QPointF(4,-6),f"{class_id}: {name}")
+            if index==self.selected:
+                painter.setBrush(color)
+                for point in (rect.topLeft(),rect.topRight(),rect.bottomLeft(),rect.bottomRight()):
+                    painter.drawEllipse(point,7,7)
+
+    def mousePressEvent(self,event):
+        scale,ox,oy=self.transform(); best=None
+        for index,box in enumerate(self.boxes):
+            _,_,x1,y1,x2,y2=box
+            corners=((x1,y1),(x2,y1),(x1,y2),(x2,y2))
+            for corner,(x,y) in enumerate(corners):
+                distance=(event.x()-(ox+x*scale))**2+(event.y()-(oy+y*scale))**2
+                if distance<=225 and (best is None or distance<best[0]): best=(distance,index,corner)
+        if best: _,self.selected,self.drag_corner=best; self.update()
+
+    def mouseMoveEvent(self,event):
+        if self.drag_corner is None or self.selected<0: return
+        scale,ox,oy=self.transform(); h,w=self.image.shape[:2]
+        x=max(0,min(w,(event.x()-ox)/scale)); y=max(0,min(h,(event.y()-oy)/scale))
+        box=self.boxes[self.selected]; x1,y1,x2,y2=box[2:]
+        if self.drag_corner in (0,2): x1=min(x,x2-1)
+        else: x2=max(x,x1+1)
+        if self.drag_corner in (0,1): y1=min(y,y2-1)
+        else: y2=max(y,y1+1)
+        box[2:]=[x1,y1,x2,y2]; self.update()
+
+    def mouseReleaseEvent(self,event):
+        self.drag_corner=None; super().mouseReleaseEvent(event)
+
+    def shrink(self,side):
+        if self.selected<0: return
+        box=self.boxes[self.selected]; x1,y1,x2,y2=box[2:]
+        if side in ("left","all") and x2-x1>1: x1+=1
+        if side in ("right","all") and x2-x1>1: x2-=1
+        if side in ("top","all") and y2-y1>1: y1+=1
+        if side in ("bottom","all") and y2-y1>1: y2-=1
+        box[2:]=[x1,y1,x2,y2]; self.update()
+class BoxEditorDialog(QDialog):
+    def __init__(self,image_path,label_path,class_names,target_line,parent=None):
+        super().__init__(parent); self.image_path=image_path; self.label_path=label_path
+        self.lines=label_path.read_text(encoding="utf-8").splitlines(); image=cv2.imread(str(image_path))
+        self.setWindowTitle(f"바운딩 박스 수정 — {image_path.name}"); self.resize(1100,760)
+        h,w=image.shape[:2]; boxes=[]; selected=0
+        for line_index,line in enumerate(self.lines):
+            parts=line.split()
+            if len(parts)!=5: continue
+            try: class_id=int(parts[0]); cx,cy,bw,bh=map(float,parts[1:])
+            except ValueError: continue
+            if line_index+1==target_line: selected=len(boxes)
+            boxes.append([line_index,class_id,(cx-bw/2)*w,(cy-bh/2)*h,(cx+bw/2)*w,(cy+bh/2)*h])
+        layout=QVBoxLayout(self); self.canvas=BoxCanvas(image,boxes,class_names,selected,self)
+        layout.addWidget(self.canvas,1); info=QLabel("꼭짓점을 드래그하거나 선택 박스의 벽을 1px 안쪽으로 이동하세요.")
+        info.setAlignment(Qt.AlignCenter); layout.addWidget(info)
+        row=QHBoxLayout()
+        for text,side in (("왼쪽 +1px","left"),("오른쪽 -1px","right"),("위쪽 +1px","top"),
+                          ("아래쪽 -1px","bottom"),("전체 1px 축소","all")):
+            button=QPushButton(text); button.clicked.connect(lambda _,s=side:self.canvas.shrink(s)); row.addWidget(button)
+        row.addStretch(); save=QPushButton("라벨 저장"); cancel=QPushButton("취소")
+        save.clicked.connect(self.save); cancel.clicked.connect(self.reject); row.addWidget(cancel); row.addWidget(save)
+        layout.addLayout(row)
+
+    def save(self):
+        h,w=self.canvas.image.shape[:2]
+        for line_index,class_id,x1,y1,x2,y2 in self.canvas.boxes:
+            x1=max(0,min(w,x1)); x2=max(0,min(w,x2)); y1=max(0,min(h,y1)); y2=max(0,min(h,y2))
+            self.lines[line_index]=(f"{class_id} {(x1+x2)/(2*w):.6f} {(y1+y2)/(2*h):.6f} "
+                                    f"{(x2-x1)/w:.6f} {(y2-y1)/h:.6f}")
+        self.label_path.write_text("\n".join(self.lines)+("\n" if self.lines else ""),encoding="utf-8")
+        self.accept()
+
+
+class AugmentationSettingDialog(QDialog):
+    def __init__(self,title,description,low_control,high_control,minimum,maximum,
+                 decimals,suffix,image,renderer,parent=None):
+        super().__init__(parent); self.low_control=low_control; self.high_control=high_control
+        self.image=image; self.renderer=renderer; self.factor=10**decimals
+        self.setWindowTitle(f"{title} 증강 설정"); self.resize(1250,700)
+        layout=QVBoxLayout(self); intro=QLabel(description); intro.setWordWrap(True)
+        intro.setStyleSheet("font-size:15px;padding:8px"); layout.addWidget(intro)
+        previews=QHBoxLayout(); self.low_preview=Preview("최소 적용"); self.original_preview=Preview("원본")
+        self.high_preview=Preview("최대 적용")
+        for heading,preview in (("최소 적용",self.low_preview),("원본",self.original_preview),("최대 적용",self.high_preview)):
+            column=QVBoxLayout(); label=QLabel(heading); label.setAlignment(Qt.AlignCenter)
+            preview.setMinimumSize(260,340); column.addWidget(label); column.addWidget(preview,1); previews.addLayout(column,1)
+        layout.addLayout(previews,1)
+        form=QFormLayout(); self.low_slider=QSlider(Qt.Horizontal); self.high_slider=QSlider(Qt.Horizontal)
+        self.low_spin=QDoubleSpinBox(); self.high_spin=QDoubleSpinBox()
+        for slider,spin,value in ((self.low_slider,self.low_spin,low_control.value()),
+                                  (self.high_slider,self.high_spin,high_control.value())):
+            slider.setRange(round(minimum*self.factor),round(maximum*self.factor)); slider.setValue(round(value*self.factor))
+            spin.setRange(minimum,maximum); spin.setDecimals(decimals); spin.setSuffix(suffix); spin.setValue(value)
+            slider.valueChanged.connect(lambda number,s=spin:s.setValue(number/self.factor))
+            spin.valueChanged.connect(lambda number,s=slider:s.setValue(round(number*self.factor)))
+            slider.valueChanged.connect(self.refresh)
+        low_row=QWidget(); low_layout=QHBoxLayout(low_row); low_layout.setContentsMargins(0,0,0,0)
+        low_layout.addWidget(self.low_slider,1); low_layout.addWidget(self.low_spin)
+        high_row=QWidget(); high_layout=QHBoxLayout(high_row); high_layout.setContentsMargins(0,0,0,0)
+        high_layout.addWidget(self.high_slider,1); high_layout.addWidget(self.high_spin)
+        form.addRow("최소",low_row); form.addRow("최대",high_row); layout.addLayout(form)
+        self.error_label=QLabel(); self.error_label.setAlignment(Qt.AlignCenter); layout.addWidget(self.error_label)
+        buttons=QHBoxLayout(); buttons.addStretch(); cancel=QPushButton("취소"); self.apply_button=QPushButton("적용")
+        cancel.clicked.connect(self.reject); self.apply_button.clicked.connect(self.apply)
+        buttons.addWidget(cancel); buttons.addWidget(self.apply_button); layout.addLayout(buttons)
+        self.original_preview.show_bgr(image); self.refresh()
+
+    def refresh(self,*_):
+        valid=self.low_spin.value()<=self.high_spin.value()
+        self.apply_button.setEnabled(valid)
+        self.error_label.setText("" if valid else "최소값은 최대값보다 클 수 없습니다.")
+        self.error_label.setStyleSheet("color:#dc2626;font-weight:bold")
+        self.low_preview.show_bgr(self.renderer(self.image,self.low_spin.value(),101))
+        self.high_preview.show_bgr(self.renderer(self.image,self.high_spin.value(),202))
+
+    def apply(self):
+        if self.low_spin.value()>self.high_spin.value():
+            QMessageBox.warning(self,"범위 오류","최소값은 최대값보다 클 수 없습니다."); return
+        self.low_control.setValue(self.low_spin.value()); self.high_control.setValue(self.high_spin.value())
+        self.accept()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, args):
         super().__init__(); self.args = args; self.capture = None
@@ -263,7 +408,8 @@ class MainWindow(QMainWindow):
         self.make_menu()
         root = QWidget(); outer = QHBoxLayout(root)
         self.controls_scroll = QScrollArea(); self.controls_scroll.setWidgetResizable(True)
-        self.controls_scroll.setMinimumWidth(390); self.controls_scroll.setMaximumWidth(390)
+        self.controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.controls_scroll.setMinimumWidth(430); self.controls_scroll.setMaximumWidth(430)
         self.controls_scroll.setWidget(self.make_controls())
         outer.addWidget(self.controls_scroll)
         self.preview_panel = QWidget(); right = QVBoxLayout(self.preview_panel); views = QHBoxLayout()
@@ -321,6 +467,7 @@ class MainWindow(QMainWindow):
         self.main_title = QLabel("HSV → YOLO"); self.main_title.setAlignment(Qt.AlignCenter)
         self.main_title.setStyleSheet("font-size:20px;font-weight:bold"); layout.addWidget(self.main_title)
         self.workflow_tabs = QTabWidget()
+        self.workflow_tabs.setSizePolicy(QSizePolicy.Ignored,QSizePolicy.Preferred)
         camera = QWidget(); form = QFormLayout(camera)
         self.camera_combo = QComboBox(); self.camera_combo.addItems(map(str, range(6)))
         self.camera_combo.setCurrentText(str(self.args.camera))
@@ -369,6 +516,21 @@ class MainWindow(QMainWindow):
         data_form.addRow("저장 간격(프레임)", self.interval)
         data_form.addRow("자동 저장", self.auto_save)
         review_page = QWidget(); review_layout = QVBoxLayout(review_page)
+        split_group=QGroupBox("Train / Valid / Test 클래스 균형 분할")
+        split_form=QFormLayout(split_group)
+        self.train_ratio=QSpinBox(); self.valid_ratio=QSpinBox(); self.test_ratio=QSpinBox()
+        self.train_ratio.setRange(0,100); self.valid_ratio.setRange(0,100); self.test_ratio.setRange(0,100)
+        self.train_ratio.setValue(70); self.valid_ratio.setValue(20); self.test_ratio.setValue(10)
+        self.split_seed=QSpinBox(); self.split_seed.setRange(0,999999999); self.split_seed.setValue(42)
+        ratio_widget=QWidget(); ratio_row=QHBoxLayout(ratio_widget); ratio_row.setContentsMargins(0,0,0,0)
+        for name,control in (("Train",self.train_ratio),("Valid",self.valid_ratio),("Test",self.test_ratio)):
+            ratio_row.addWidget(QLabel(name)); ratio_row.addWidget(control)
+        preview_split=QPushButton("분할 예상 확인"); run_split=QPushButton("클래스 균형 분할 실행")
+        preview_split.clicked.connect(self.preview_dataset_split); run_split.clicked.connect(self.execute_dataset_split)
+        split_form.addRow("비율 (%)",ratio_widget); split_form.addRow("랜덤 시드",self.split_seed)
+        split_buttons=QWidget(); split_row=QHBoxLayout(split_buttons); split_row.setContentsMargins(0,0,0,0)
+        split_row.addWidget(preview_split); split_row.addWidget(run_split)
+        split_form.addRow("",split_buttons); review_layout.addWidget(split_group)
         self.review_summary = QLabel("데이터 통계를 불러오는 중...")
         self.review_summary.setStyleSheet("font-size:18px;font-weight:bold;padding:8px")
         self.review_table = QTableWidget(0,4)
@@ -381,11 +543,95 @@ class MainWindow(QMainWindow):
         self.review_table.horizontalHeader().setSectionResizeMode(3,QHeaderView.ResizeToContents)
         refresh_info = QPushButton("통계 새로고침")
         refresh_info.clicked.connect(self.refresh_review_table)
-        review_layout.addWidget(self.review_summary); review_layout.addWidget(self.review_table,1)
-        review_layout.addWidget(refresh_info)
+        review_sections=QTabWidget(); stats_page=QWidget(); stats_layout=QVBoxLayout(stats_page)
+        stats_layout.addWidget(self.review_summary); stats_layout.addWidget(self.review_table,1)
+        stats_layout.addWidget(refresh_info)
+        errors_page=QWidget(); errors_layout=QVBoxLayout(errors_page)
+        error_controls=QHBoxLayout(); self.error_scan_button=QPushButton("전체 데이터 오류 검사")
+        self.error_scan_running=False; self.error_scan_button.clicked.connect(self.scan_dataset_errors)
+        self.error_summary=QLabel("검사를 실행하면 이미지와 라벨의 오류를 확인합니다.")
+        error_controls.addWidget(self.error_scan_button); error_controls.addWidget(self.error_summary,1)
+        self.error_table=QTableWidget(0,5)
+        self.error_table.setHorizontalHeaderLabels(("Split","파일","행","문제","수정"))
+        self.error_table.verticalHeader().setVisible(False); self.error_table.setAlternatingRowColors(True)
+        self.error_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.error_table.horizontalHeader().setSectionResizeMode(0,QHeaderView.ResizeToContents)
+        self.error_table.horizontalHeader().setSectionResizeMode(1,QHeaderView.ResizeToContents)
+        self.error_table.horizontalHeader().setSectionResizeMode(2,QHeaderView.ResizeToContents)
+        self.error_table.horizontalHeader().setSectionResizeMode(3,QHeaderView.Stretch)
+        self.error_table.horizontalHeader().setSectionResizeMode(4,QHeaderView.ResizeToContents)
+        errors_layout.addLayout(error_controls); errors_layout.addWidget(self.error_table,1)
+        review_sections.addTab(stats_page,"클래스 통계"); review_sections.addTab(errors_page,"오류 파일")
+        review_layout.addWidget(review_sections,1)
+        aug_page=QWidget(); aug_page_layout=QHBoxLayout(aug_page)
+        aug_settings_scroll=QScrollArea(); aug_settings_scroll.setWidgetResizable(True)
+        aug_settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        aug_settings_scroll.setMinimumWidth(390); aug_settings_scroll.setMaximumWidth(430)
+        aug_settings=QWidget(); aug_form=QFormLayout(aug_settings)
+        aug_settings_scroll.setWidget(aug_settings); aug_page_layout.addWidget(aug_settings_scroll)
+        aug_intro=QLabel("원본 데이터셋은 유지하고 같은 위치에 '<폴더명>_aug' 데이터셋을 생성합니다.\n"
+                         "Train만 증강하며 Valid/Test는 원본 그대로 복사합니다.")
+        aug_intro.setWordWrap(True); aug_intro.setStyleSheet("font-size:15px;padding:8px")
+        self.aug_outputs=QSpinBox(); self.aug_outputs.setRange(1,20); self.aug_outputs.setValue(3)
+        self.aug_sat_min,self.aug_sat_max=QSpinBox(),QSpinBox()
+        self.aug_bright_min,self.aug_bright_max=QSpinBox(),QSpinBox()
+        self.aug_exposure_min,self.aug_exposure_max=QSpinBox(),QSpinBox()
+        for control in (self.aug_sat_min,self.aug_sat_max,self.aug_bright_min,self.aug_bright_max,
+                        self.aug_exposure_min,self.aug_exposure_max): control.setRange(-100,100)
+        self.aug_sat_min.setValue(-25); self.aug_sat_max.setValue(25)
+        self.aug_bright_min.setValue(-15); self.aug_bright_max.setValue(15)
+        self.aug_exposure_min.setValue(-10); self.aug_exposure_max.setValue(10)
+        self.aug_blur_min=QDoubleSpinBox(); self.aug_blur=QDoubleSpinBox()
+        for control in (self.aug_blur_min,self.aug_blur): control.setRange(0,20); control.setDecimals(1); control.setSuffix(" px")
+        self.aug_blur_min.setValue(0); self.aug_blur.setValue(2.5)
+        self.aug_noise_min=QDoubleSpinBox(); self.aug_noise=QDoubleSpinBox()
+        for control in (self.aug_noise_min,self.aug_noise): control.setRange(0,10); control.setDecimals(3); control.setSuffix(" %")
+        self.aug_noise_min.setValue(0); self.aug_noise.setValue(0.1)
+        self.aug_seed=QSpinBox(); self.aug_seed.setRange(0,999999999); self.aug_seed.setValue(42)
+        self.aug_skip_background=QCheckBox("라벨 없는 배경 이미지 증강 제외")
+        self.aug_skip_background.setChecked(True); self.aug_preview_image=None; self.aug_preview_variant=0
+        self.aug_setting_buttons={}
+        for kind,title in (("saturation","Saturation"),("brightness","Brightness"),
+                           ("exposure","Exposure"),("blur","Blur"),("noise","Noise")):
+            button=QPushButton(); button.clicked.connect(lambda _,k=kind:self.open_augmentation_setting(k))
+            self.aug_setting_buttons[kind]=button
+        aug_buttons=QWidget(); aug_box=QVBoxLayout(aug_buttons); aug_box.setContentsMargins(0,0,0,0)
+        aug_preview_row=QHBoxLayout()
+        aug_preview=QPushButton("첫 Train 이미지 미리보기"); aug_reroll=QPushButton("다른 랜덤 결과")
+        aug_run=QPushButton("새 _aug 데이터셋 생성")
+        aug_preview.clicked.connect(self.preview_augmentation); aug_run.clicked.connect(self.run_augmentation)
+        aug_reroll.clicked.connect(self.reroll_augmentation_preview)
+        aug_preview_row.addWidget(aug_preview); aug_preview_row.addWidget(aug_reroll)
+        aug_box.addLayout(aug_preview_row); aug_box.addWidget(aug_run)
+        self.aug_estimate=QLabel(); self.aug_outputs.valueChanged.connect(self.update_augmentation_estimate)
+        aug_form.addRow(aug_intro); aug_form.addRow("증강본 수 / 원본",self.aug_outputs)
+        for kind in ("saturation","brightness","exposure","blur","noise"):
+            aug_form.addRow(self.aug_setting_buttons[kind])
+        aug_form.addRow("랜덤 시드",self.aug_seed); aug_form.addRow("배경 처리",self.aug_skip_background)
+        aug_form.addRow("예상 결과",self.aug_estimate)
+        aug_form.addRow("",aug_buttons)
+        preview_widget=QWidget(); preview_row=QHBoxLayout(preview_widget)
+        original_col=QVBoxLayout(); original_title=QLabel("원본"); original_title.setAlignment(Qt.AlignCenter)
+        self.aug_original_preview=Preview("미리보기 버튼을 누르세요")
+        result_col=QVBoxLayout(); result_title=QLabel("증강 결과"); result_title.setAlignment(Qt.AlignCenter)
+        self.aug_result_preview=Preview("설정 변경이 실시간 반영됩니다")
+        for preview in (self.aug_original_preview,self.aug_result_preview):
+            preview.setMinimumSize(0,260)
+            preview.setSizePolicy(QSizePolicy.Ignored,QSizePolicy.Expanding)
+        original_col.addWidget(original_title); original_col.addWidget(self.aug_original_preview,1)
+        result_col.addWidget(result_title); result_col.addWidget(self.aug_result_preview,1)
+        preview_row.addLayout(original_col,1); preview_row.addLayout(result_col,1)
+        aug_page_layout.addWidget(preview_widget,1)
+        for control in (self.aug_outputs,self.aug_sat_min,self.aug_sat_max,self.aug_bright_min,
+                        self.aug_bright_max,self.aug_exposure_min,self.aug_exposure_max,
+                        self.aug_blur_min,self.aug_blur,self.aug_noise_min,self.aug_noise,self.aug_seed):
+            control.valueChanged.connect(self.refresh_augmentation_preview)
+        self.aug_skip_background.stateChanged.connect(self.update_augmentation_estimate)
+        self.update_augmentation_button_texts()
         self.workflow_tabs.addTab(camera,"실시간 카메라")
         self.workflow_tabs.addTab(video,"영상")
         self.workflow_tabs.addTab(review_page,"검수")
+        self.workflow_tabs.addTab(aug_page,"증강")
         layout.addWidget(self.workflow_tabs)
         layout.addWidget(self.labeling_panel)
         self.workflow_tabs.currentChanged.connect(self.change_workflow_tab)
@@ -416,13 +662,14 @@ class MainWindow(QMainWindow):
         buttons.addWidget(reset); buttons.addWidget(save,1); layout.addWidget(self.action_panel)
         self.status = QLabel("준비 중..."); self.status.setWordWrap(True)
         self.status.setStyleSheet("padding:6px;background:#20242a;color:#e8e8e8")
-        layout.addWidget(self.status); layout.addStretch()
+        layout.addWidget(self.status)
         self.start_h.slider.valueChanged.connect(self.update_ring)
         self.end_h.slider.valueChanged.connect(self.update_ring)
         self.move_h.slider.valueChanged.connect(self.move_hue_range)
         for control in (self.start_h,self.end_h,self.s_low,self.s_high,self.v_low,self.v_high):
             control.slider.valueChanged.connect(self.update_spectrum)
         self.camera_combo.currentTextChanged.connect(lambda text: self.open_camera(int(text)))
+        self.update_augmentation_estimate()
         return panel
 
     def update_ring(self): self.ring.set_range(self.start_h.value(), self.end_h.value())
@@ -719,18 +966,21 @@ class MainWindow(QMainWindow):
         self.refresh_review_table()
 
     def change_workflow_tab(self, index):
-        review = index == 2
-        self.preview_panel.setVisible(not review)
+        full_page = index in (2,3)
+        self.preview_panel.setVisible(not full_page)
         for panel in (self.labeling_panel,self.hue_panel,self.sv_panel,self.filter_panel,
                       self.action_panel,self.status):
-            panel.setVisible(not review)
-        self.main_title.setText("데이터셋 검수" if review else "HSV → YOLO")
-        if review:
+            panel.setVisible(not full_page)
+        self.main_title.setText(("데이터셋 검수" if index==2 else "데이터 증강") if full_page else "HSV → YOLO")
+        if full_page:
             self.controls_scroll.setMinimumWidth(0); self.controls_scroll.setMaximumWidth(16777215)
             self.workflow_tabs.setMinimumHeight(520); self.workflow_tabs.setMaximumHeight(16777215)
-            self.refresh_review_table()
+            self.workflow_tabs.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Expanding)
+            if index==2: self.refresh_review_table()
+            else: self.update_augmentation_estimate()
         else:
-            self.controls_scroll.setMinimumWidth(390); self.controls_scroll.setMaximumWidth(390)
+            self.controls_scroll.setMinimumWidth(430); self.controls_scroll.setMaximumWidth(430)
+            self.workflow_tabs.setSizePolicy(QSizePolicy.Ignored,QSizePolicy.Preferred)
             page_height=self.workflow_tabs.widget(index).sizeHint().height()+42
             self.workflow_tabs.setMinimumHeight(page_height); self.workflow_tabs.setMaximumHeight(page_height)
 
@@ -749,6 +999,393 @@ class MainWindow(QMainWindow):
             button=QPushButton("클래스 검수")
             button.clicked.connect(lambda _,cid=class_id:self.open_review(cid))
             self.review_table.setCellWidget(class_id,3,button); self.review_table.setRowHeight(class_id,42)
+
+    def scan_dataset_errors(self):
+        if self.error_scan_running: return
+        self.error_scan_running=True; self.error_scan_button.setEnabled(False)
+        self.error_summary.setText("검사 중..."); QApplication.processEvents()
+        extensions={".jpg",".jpeg",".png",".bmp",".webp"}; errors=[]
+        for split in ("train","valid","test"):
+            image_dir=self.dataset_dir/split/"images"; label_dir=self.dataset_dir/split/"labels"
+            images={}
+            for path in image_dir.glob("*"):
+                if path.suffix.lower() in extensions: images.setdefault(path.stem,[]).append(path)
+            labels={path.stem:path for path in label_dir.glob("*.txt")}
+            for stem,paths in images.items():
+                if len(paths)>1:
+                    errors.append((split,", ".join(path.name for path in paths),"-","같은 이름의 이미지가 여러 형식으로 존재"))
+                image_path=paths[0]
+                if cv2.imread(str(image_path)) is None:
+                    errors.append((split,image_path.name,"-","이미지가 손상되었거나 읽을 수 없음"))
+                if stem not in labels:
+                    errors.append((split,image_path.name,"-","대응하는 라벨 파일 없음"))
+            for stem,label_path in labels.items():
+                if stem not in images:
+                    errors.append((split,label_path.name,"-","대응하는 이미지 파일 없음"))
+                try: lines=label_path.read_text(encoding="utf-8").splitlines()
+                except (OSError,UnicodeError) as error:
+                    errors.append((split,label_path.name,"-",f"라벨 파일을 읽을 수 없음: {error}")); continue
+                for line_number,line in enumerate(lines,1):
+                    if not line.strip(): continue
+                    parts=line.split()
+                    if len(parts)!=5:
+                        errors.append((split,label_path.name,str(line_number),"YOLO 라벨은 5개 값이어야 함")); continue
+                    try: class_id=int(parts[0]); cx,cy,width,height=map(float,parts[1:])
+                    except ValueError:
+                        errors.append((split,label_path.name,str(line_number),"숫자 형식 오류")); continue
+                    if not all(math.isfinite(value) for value in (cx,cy,width,height)):
+                        errors.append((split,label_path.name,str(line_number),"NaN 또는 무한대 좌표")); continue
+                    if not 0<=class_id<len(self.class_names):
+                        errors.append((split,label_path.name,str(line_number),f"존재하지 않는 클래스 ID {class_id}"))
+                    if width<=0 or height<=0:
+                        errors.append((split,label_path.name,str(line_number),"박스 너비 또는 높이가 0 이하")); continue
+                    if not all(0<=value<=1 for value in (cx,cy,width,height)):
+                        errors.append((split,label_path.name,str(line_number),"정규화 좌표가 0~1 범위를 벗어남"))
+                    if cx-width/2 < 0 or cy-height/2 < 0 or cx+width/2 > 1 or cy+height/2 > 1:
+                        errors.append((split,label_path.name,str(line_number),"바운딩 박스가 이미지 경계를 벗어남"))
+        self.show_dataset_errors(errors)
+
+    def show_dataset_errors(self,errors):
+        self.dataset_errors=errors; self.error_table.setRowCount(len(errors))
+        for row,values in enumerate(errors):
+            for column,value in enumerate(values): self.error_table.setItem(row,column,QTableWidgetItem(str(value)))
+            split,file_name,line_number,_=values
+            if file_name.lower().endswith(".txt") and line_number.isdigit():
+                edit=QPushButton("박스 수정"); edit.clicked.connect(lambda _,r=row:self.open_error_editor(r))
+                self.error_table.setCellWidget(row,4,edit)
+        if errors:
+            self.error_summary.setText(f"오류 {len(errors)}건 발견")
+            self.error_summary.setStyleSheet("font-weight:bold;color:#dc2626")
+        else:
+            self.error_summary.setText("오류 없음 — 이미지와 라벨 쌍 및 좌표가 정상입니다.")
+            self.error_summary.setStyleSheet("font-weight:bold;color:#16a34a")
+        QTimer.singleShot(500,self.finish_error_scan)
+
+    def finish_error_scan(self):
+        self.error_scan_running=False; self.error_scan_button.setEnabled(True)
+
+    def open_error_editor(self,row):
+        if row<0 or row>=len(getattr(self,"dataset_errors",[])): return
+        split,file_name,line_number,_=self.dataset_errors[row]
+        label_path=self.dataset_dir/split/"labels"/file_name
+        image_dir=self.dataset_dir/split/"images"
+        matches=[path for path in image_dir.glob(f"{Path(file_name).stem}.*")
+                 if path.suffix.lower() in {".jpg",".jpeg",".png",".bmp",".webp"}]
+        if not label_path.exists() or not matches:
+            QMessageBox.warning(self,"수정 불가","대응하는 이미지와 라벨 파일을 찾을 수 없습니다."); return
+        try: dialog=BoxEditorDialog(matches[0],label_path,self.class_names,int(line_number),self)
+        except Exception as error:
+            QMessageBox.critical(self,"편집기 오류",str(error)); return
+        if not dialog.canvas.boxes:
+            QMessageBox.warning(self,"수정 불가","편집할 수 있는 정상 형식의 박스가 없습니다."); return
+        if dialog.exec_()==QDialog.Accepted: self.recheck_edited_label(split,file_name,int(line_number))
+
+    def validate_label_line(self,label_path,line_number):
+        try: lines=label_path.read_text(encoding="utf-8").splitlines()
+        except (OSError,UnicodeError) as error: return [f"라벨 파일을 읽을 수 없음: {error}"]
+        if line_number<1 or line_number>len(lines): return ["라벨 행이 존재하지 않음"]
+        parts=lines[line_number-1].split()
+        if len(parts)!=5: return ["YOLO 라벨은 5개 값이어야 함"]
+        try: class_id=int(parts[0]); cx,cy,width,height=map(float,parts[1:])
+        except ValueError: return ["숫자 형식 오류"]
+        problems=[]
+        if not all(math.isfinite(value) for value in (cx,cy,width,height)):
+            return ["NaN 또는 무한대 좌표"]
+        if not 0<=class_id<len(self.class_names): problems.append(f"존재하지 않는 클래스 ID {class_id}")
+        if width<=0 or height<=0: problems.append("박스 너비 또는 높이가 0 이하")
+        else:
+            if not all(0<=value<=1 for value in (cx,cy,width,height)):
+                problems.append("정규화 좌표가 0~1 범위를 벗어남")
+            if cx-width/2<0 or cy-height/2<0 or cx+width/2>1 or cy+height/2>1:
+                problems.append("바운딩 박스가 이미지 경계를 벗어남")
+        return problems
+
+    def recheck_edited_label(self,split,file_name,line_number):
+        remaining=[error for error in getattr(self,"dataset_errors",[])
+                   if not (error[0]==split and error[1]==file_name and error[2]==str(line_number))]
+        label_path=self.dataset_dir/split/"labels"/file_name
+        remaining.extend((split,file_name,str(line_number),problem)
+                         for problem in self.validate_label_line(label_path,line_number))
+        self.show_dataset_errors(remaining)
+        self.error_summary.setText(
+            f"수정 행만 재검사 완료 — 남은 오류 {len(remaining)}건 | 전체 확인은 '전체 데이터 오류 검사'")
+
+    def all_train_images(self):
+        extensions={".jpg",".jpeg",".png",".bmp",".webp"}
+        return sorted(path for path in (self.dataset_dir/"train/images").glob("*")
+                      if path.suffix.lower() in extensions and "_aug_" not in path.stem)
+
+    def train_images(self):
+        images=self.all_train_images()
+        if hasattr(self,"aug_skip_background") and self.aug_skip_background.isChecked():
+            images=[path for path in images if not self.is_background_image(path)]
+        return images
+
+    def is_background_image(self, image_path):
+        label=self.dataset_dir/"train/labels"/f"{image_path.stem}.txt"
+        return not label.exists() or not label.read_text(encoding="utf-8").strip()
+
+    def update_augmentation_estimate(self):
+        if not hasattr(self,"aug_estimate"): return
+        original=len(self.all_train_images()); eligible=len(self.train_images())
+        augmented=eligible*self.aug_outputs.value()
+        self.aug_estimate.setText(
+            f"전체 원본 {original:,}장 + 증강 {augmented:,}장 (대상 {eligible:,}장) = Train {original+augmented:,}장")
+
+    def augmentation_ranges_valid(self):
+        pairs=((self.aug_sat_min,self.aug_sat_max,"Saturation"),
+               (self.aug_bright_min,self.aug_bright_max,"Brightness"),
+               (self.aug_exposure_min,self.aug_exposure_max,"Exposure"),
+               (self.aug_blur_min,self.aug_blur,"Blur"),
+               (self.aug_noise_min,self.aug_noise,"Noise"))
+        for low,high,name in pairs:
+            if low.value()>high.value():
+                QMessageBox.warning(self,"증강 범위 오류",f"{name}의 최소값이 최대값보다 큽니다."); return False
+        return True
+
+    def update_augmentation_button_texts(self):
+        if not hasattr(self,"aug_setting_buttons"): return
+        values={
+            "saturation":f"Saturation  {self.aug_sat_min.value():+d}% ~ {self.aug_sat_max.value():+d}%",
+            "brightness":f"Brightness  {self.aug_bright_min.value():+d}% ~ {self.aug_bright_max.value():+d}%",
+            "exposure":f"Exposure  {self.aug_exposure_min.value():+d}% ~ {self.aug_exposure_max.value():+d}%",
+            "blur":f"Blur  {self.aug_blur_min.value():.1f}px ~ {self.aug_blur.value():.1f}px",
+            "noise":f"Noise  {self.aug_noise_min.value():.3f}% ~ {self.aug_noise.value():.3f}%",
+        }
+        for kind,text in values.items(): self.aug_setting_buttons[kind].setText(text)
+
+    def apply_single_augmentation(self,image,kind,value,seed):
+        if kind=="saturation":
+            hsv=cv2.cvtColor(image,cv2.COLOR_BGR2HSV).astype(np.float32)
+            hsv[:,:,1]=np.clip(hsv[:,:,1]*(1+value/100),0,255)
+            return cv2.cvtColor(hsv.astype(np.uint8),cv2.COLOR_HSV2BGR)
+        if kind=="brightness":
+            return np.clip(image.astype(np.float32)+value*2.55,0,255).astype(np.uint8)
+        if kind=="exposure":
+            return np.clip(image.astype(np.float32)*(1+value/100),0,255).astype(np.uint8)
+        if kind=="blur":
+            if value<0.15: return image.copy()
+            kernel=max(3,int(math.ceil(value*3))*2+1)
+            return cv2.GaussianBlur(image,(kernel,kernel),value)
+        result=image.copy(); count=round(result.shape[0]*result.shape[1]*value/100)
+        if count:
+            rng=np.random.default_rng(seed); ys=rng.integers(0,result.shape[0],count)
+            xs=rng.integers(0,result.shape[1],count)
+            result[ys,xs]=rng.integers(0,256,(count,3),dtype=np.uint8)
+        return result
+
+    def open_augmentation_setting(self,kind):
+        if self.aug_preview_image is None:
+            images=self.train_images()
+            if not images:
+                QMessageBox.warning(self,"설정 미리보기 불가","증강 가능한 Train 이미지가 없습니다."); return
+            self.aug_preview_image=cv2.imread(str(images[0]))
+            if self.aug_preview_image is None:
+                QMessageBox.warning(self,"설정 미리보기 불가","첫 Train 이미지를 읽을 수 없습니다."); return
+            self.aug_original_preview.show_bgr(self.aug_preview_image)
+        configs={
+            "saturation":("Saturation","색의 선명도입니다. 음수는 무채색에 가깝게, 양수는 색을 진하게 만듭니다.",self.aug_sat_min,self.aug_sat_max,-100,100,0," %"),
+            "brightness":("Brightness","픽셀 밝기를 일정하게 올리거나 내려 전체 영상을 밝고 어둡게 만듭니다.",self.aug_bright_min,self.aug_bright_max,-100,100,0," %"),
+            "exposure":("Exposure","밝기 값을 비율로 증폭하거나 감소시켜 노출 차이를 만듭니다.",self.aug_exposure_min,self.aug_exposure_max,-100,100,0," %"),
+            "blur":("Blur","가우시안 블러 강도입니다. 0은 원본이며 값이 클수록 흐려집니다.",self.aug_blur_min,self.aug_blur,0,20,1," px"),
+            "noise":("Noise","무작위 픽셀 잡음 비율입니다. 0은 원본이며 과도한 값은 학습을 방해할 수 있습니다.",self.aug_noise_min,self.aug_noise,0,10,3," %"),
+        }
+        title,description,low,high,minimum,maximum,decimals,suffix=configs[kind]
+        renderer=lambda image,value,seed:self.apply_single_augmentation(image,kind,value,seed)
+        dialog=AugmentationSettingDialog(title,description,low,high,minimum,maximum,
+                                         decimals,suffix,self.aug_preview_image,renderer,self)
+        available=QApplication.primaryScreen().availableGeometry()
+        dialog.resize(min(1250,available.width()-60),min(700,available.height()-80))
+        if dialog.exec_()==QDialog.Accepted:
+            self.update_augmentation_button_texts(); self.refresh_augmentation_preview()
+
+    def augment_image(self, image, rng):
+        saturation=rng.uniform(self.aug_sat_min.value(),self.aug_sat_max.value())/100
+        brightness=rng.uniform(self.aug_bright_min.value(),self.aug_bright_max.value())/100
+        exposure=rng.uniform(self.aug_exposure_min.value(),self.aug_exposure_max.value())/100
+        result=np.clip(image.astype(np.float32)*(1+exposure)+brightness*255,0,255).astype(np.uint8)
+        hsv=cv2.cvtColor(result,cv2.COLOR_BGR2HSV).astype(np.float32)
+        hsv[:,:,1]=np.clip(hsv[:,:,1]*(1+saturation),0,255)
+        result=cv2.cvtColor(hsv.astype(np.uint8),cv2.COLOR_HSV2BGR)
+        sigma=rng.uniform(self.aug_blur_min.value(),self.aug_blur.value())
+        if sigma>=0.15:
+            kernel=max(3,int(math.ceil(sigma*3))*2+1)
+            result=cv2.GaussianBlur(result,(kernel,kernel),sigma)
+        pixel_count=round(result.shape[0]*result.shape[1]*
+                          rng.uniform(self.aug_noise_min.value(),self.aug_noise.value())/100)
+        if pixel_count>0:
+            noise_rng=np.random.default_rng(rng.randrange(2**32))
+            ys=noise_rng.integers(0,result.shape[0],pixel_count)
+            xs=noise_rng.integers(0,result.shape[1],pixel_count)
+            result[ys,xs]=noise_rng.integers(0,256,(pixel_count,3),dtype=np.uint8)
+        return result
+
+    def preview_augmentation(self):
+        if not self.augmentation_ranges_valid(): return
+        images=self.train_images()
+        if not images:
+            QMessageBox.warning(self,"미리보기 불가","증강 가능한 Train 이미지가 없습니다.\n배경 제외 옵션도 확인하세요."); return
+        original=cv2.imread(str(images[0]))
+        if original is None:
+            QMessageBox.warning(self,"미리보기 불가",f"이미지를 읽을 수 없습니다: {images[0].name}"); return
+        self.aug_preview_image=original; self.aug_preview_variant=0
+        self.aug_original_preview.show_bgr(original); self.refresh_augmentation_preview()
+
+    def reroll_augmentation_preview(self):
+        if self.aug_preview_image is None: self.preview_augmentation(); return
+        self.aug_preview_variant+=1; self.refresh_augmentation_preview()
+
+    def refresh_augmentation_preview(self,*_):
+        self.update_augmentation_estimate()
+        valid=(self.aug_sat_min.value()<=self.aug_sat_max.value() and
+               self.aug_bright_min.value()<=self.aug_bright_max.value() and
+               self.aug_exposure_min.value()<=self.aug_exposure_max.value() and
+               self.aug_blur_min.value()<=self.aug_blur.value() and
+               self.aug_noise_min.value()<=self.aug_noise.value())
+        if self.aug_preview_image is None or not valid: return
+        rng=random.Random(self.aug_seed.value()+self.aug_preview_variant*1000003)
+        self.aug_result_preview.show_bgr(self.augment_image(self.aug_preview_image,rng))
+
+    def run_augmentation(self):
+        if not self.augmentation_ranges_valid(): return
+        images=self.train_images()
+        if not images:
+            QMessageBox.warning(self,"증강 불가","train/images에 원본 이미지가 없습니다."); return
+        source=self.dataset_dir.resolve(); destination=source.parent/f"{source.name}_aug"; suffix=2
+        while destination.exists(): destination=source.parent/f"{source.name}_aug_{suffix}"; suffix+=1
+        total=len(images)*self.aug_outputs.value()
+        answer=QMessageBox.question(self,"새 증강 데이터셋 생성",
+            f"{destination.name}\n\nTrain 증강본 {total:,}장을 생성할까요?\n원본 데이터셋은 변경하지 않습니다.",
+            QMessageBox.Yes|QMessageBox.No,QMessageBox.No)
+        if answer!=QMessageBox.Yes: return
+        stage=source.parent/f".{destination.name}_tmp_{uuid.uuid4().hex}"
+        progress=QProgressDialog("원본 데이터셋 복사 중...","취소",0,total,self)
+        progress.setWindowTitle("데이터 증강"); progress.setWindowModality(Qt.WindowModal); progress.show()
+        try:
+            shutil.copytree(source,stage)
+            rng=random.Random(self.aug_seed.value()); completed=0
+            output_images=stage/"train/images"; output_labels=stage/"train/labels"
+            for image_path in images:
+                image=cv2.imread(str(image_path))
+                if image is None: raise RuntimeError(f"이미지를 읽을 수 없습니다: {image_path.name}")
+                source_label=source/"train/labels"/f"{image_path.stem}.txt"
+                for index in range(1,self.aug_outputs.value()+1):
+                    if progress.wasCanceled(): raise InterruptedError
+                    stem=f"{image_path.stem}_aug_{index:03d}"
+                    augmented=self.augment_image(image,rng)
+                    if not cv2.imwrite(str(output_images/f"{stem}{image_path.suffix}"),augmented):
+                        raise RuntimeError(f"이미지 저장 실패: {stem}")
+                    target_label=output_labels/f"{stem}.txt"
+                    if source_label.exists(): shutil.copy2(source_label,target_label)
+                    else: target_label.write_text("",encoding="utf-8")
+                    completed+=1; progress.setValue(completed); QApplication.processEvents()
+            yaml_lines=["# Ultralytics YOLO11 dataset","path: .","train: train/images",
+                        "val: valid/images","test: test/images","",f"nc: {len(self.class_names)}","names:"]
+            yaml_lines.extend(f"  {i}: '{name.replace(chr(39),chr(39)*2)}'" for i,name in enumerate(self.class_names))
+            (stage/"data.yaml").write_text("\n".join(yaml_lines)+"\n",encoding="utf-8")
+            stage.rename(destination); progress.setValue(total)
+        except InterruptedError:
+            if stage.exists(): shutil.rmtree(stage)
+            progress.close(); QMessageBox.information(self,"증강 취소","임시 결과를 삭제했습니다."); return
+        except Exception as error:
+            progress.close(); QMessageBox.critical(self,"증강 실패",f"임시 결과를 보존했습니다.\n{stage}\n\n{error}"); return
+        QMessageBox.information(self,"증강 완료",f"새 데이터셋을 생성했습니다.\n{destination}")
+
+    def dataset_items(self):
+        extensions={".jpg",".jpeg",".png",".bmp",".webp"}; items=[]
+        for split in ("train","valid","test"):
+            for image in sorted((self.dataset_dir/split/"images").glob("*")):
+                if image.suffix.lower() not in extensions: continue
+                label=self.dataset_dir/split/"labels"/f"{image.stem}.txt"
+                counts=[0]*len(self.class_names)
+                if label.exists():
+                    for line in label.read_text(encoding="utf-8").splitlines():
+                        try: class_id=int(line.split()[0])
+                        except (ValueError,IndexError): continue
+                        if 0<=class_id<len(counts): counts[class_id]+=1
+                items.append((image,label,counts))
+        return items
+
+    def make_split_plan(self):
+        ratios=[self.train_ratio.value(),self.valid_ratio.value(),self.test_ratio.value()]
+        if sum(ratios)!=100:
+            QMessageBox.warning(self,"비율 오류",f"Train + Valid + Test 합계가 100이어야 합니다. 현재 {sum(ratios)}입니다.")
+            return None
+        items=self.dataset_items(); total=len(items)
+        if total==0:
+            QMessageBox.warning(self,"데이터 없음","분할할 이미지가 없습니다."); return None
+        raw=[total*ratio/100 for ratio in ratios]; target=[int(value) for value in raw]
+        for index in sorted(range(3),key=lambda i:raw[i]-target[i],reverse=True)[:total-sum(target)]: target[index]+=1
+        class_totals=[sum(item[2][c] for item in items) for c in range(len(self.class_names))]
+        class_targets=[[value*ratio/100 for value in class_totals] for ratio in ratios]
+        assigned=[[],[],[]]; class_now=[[0]*len(self.class_names) for _ in range(3)]
+        rng=random.Random(self.split_seed.value())
+        decorated=[]
+        for item in items:
+            rarity=sum(count/max(1,class_totals[c]) for c,count in enumerate(item[2]))
+            decorated.append((rarity,sum(item[2]),rng.random(),item))
+        for _,_,_,item in sorted(decorated,reverse=True,key=lambda row:(row[0],row[1],row[2])):
+            candidates=[i for i in range(3) if len(assigned[i])<target[i]] or list(range(3))
+            def score(i):
+                class_need=sum(count*max(0,class_targets[i][c]-class_now[i][c])/
+                               max(1,class_targets[i][c]) for c,count in enumerate(item[2]))
+                capacity=(target[i]-len(assigned[i]))/max(1,target[i])
+                return class_need+0.25*capacity+rng.random()*1e-8
+            chosen=max(candidates,key=score); assigned[chosen].append(item)
+            for c,count in enumerate(item[2]): class_now[chosen][c]+=count
+        return assigned,class_now
+
+    def split_summary(self, plan):
+        assigned,class_counts=plan; names=("Train","Valid","Test")
+        lines=[f"{names[i]}: 이미지 {len(assigned[i])}장" for i in range(3)]
+        lines.append("")
+        for class_id,name in enumerate(self.class_names):
+            values=" / ".join(str(class_counts[i][class_id]) for i in range(3))
+            lines.append(f"{class_id} {name}: {values}  (Train / Valid / Test)")
+        return "\n".join(lines)
+
+    def preview_dataset_split(self):
+        plan=self.make_split_plan()
+        if plan: QMessageBox.information(self,"클래스 균형 분할 예상",self.split_summary(plan))
+
+    def execute_dataset_split(self):
+        plan=self.make_split_plan()
+        if not plan: return
+        answer=QMessageBox.question(self,"데이터셋 분할 실행",
+            self.split_summary(plan)+"\n\n이미지와 라벨을 위 구성으로 이동할까요?",
+            QMessageBox.Yes|QMessageBox.No,QMessageBox.No)
+        if answer!=QMessageBox.Yes: return
+        stage=self.dataset_dir/f".split_staging_{uuid.uuid4().hex}"
+        stage.mkdir(parents=True)
+        staged=[]
+        try:
+            for split_index,items in enumerate(plan[0]):
+                for item_index,(image,label,_) in enumerate(items):
+                    token=f"{split_index}_{item_index}_{image.name}"
+                    staged_image=stage/token; shutil.move(str(image),str(staged_image))
+                    staged_label=None
+                    if label.exists():
+                        staged_label=stage/f"{split_index}_{item_index}_{label.name}"
+                        shutil.move(str(label),str(staged_label))
+                    staged.append((split_index,staged_image,staged_label,image.name))
+            split_names=("train","valid","test")
+            for split_index,image,label,original_name in staged:
+                image_dir=self.dataset_dir/split_names[split_index]/"images"
+                label_dir=self.dataset_dir/split_names[split_index]/"labels"
+                destination=image_dir/original_name; suffix=1
+                while destination.exists():
+                    destination=image_dir/f"{Path(original_name).stem}_split{suffix}{Path(original_name).suffix}"; suffix+=1
+                shutil.move(str(image),str(destination))
+                label_destination=label_dir/f"{destination.stem}.txt"
+                if label is not None: shutil.move(str(label),str(label_destination))
+                else: label_destination.write_text("",encoding="utf-8")
+        except Exception as error:
+            QMessageBox.critical(self,"분할 실패",
+                f"분할 중 오류가 발생했습니다. 복구를 위해 임시 파일을 유지합니다.\n{stage}\n\n{error}")
+            return
+        if stage.exists(): shutil.rmtree(stage)
+        self.refresh_review_table()
+        QMessageBox.information(self,"분할 완료","클래스 분포를 고려해 데이터셋을 분할했습니다.")
 
     def class_box_counts(self):
         counts = [0] * len(self.class_names); invalid = 0
@@ -807,7 +1444,13 @@ class MainWindow(QMainWindow):
 
 def main():
     args=parse_args(); app=QApplication(sys.argv); app.setStyle("Fusion")
-    window=MainWindow(args); window.show(); return app.exec_()
+    window=MainWindow(args)
+    available=app.primaryScreen().availableGeometry()
+    window.resize(min(1480,max(900,available.width()-40)),
+                  min(880,max(650,available.height()-60)))
+    window.move(available.x()+(available.width()-window.width())//2,
+                available.y()+(available.height()-window.height())//2)
+    window.show(); return app.exec_()
 
 
 if __name__=="__main__": raise SystemExit(main())
