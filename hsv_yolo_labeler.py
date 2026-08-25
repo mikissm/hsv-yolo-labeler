@@ -334,10 +334,15 @@ class MainWindow(QMainWindow):
         self.video_path_edit.setPlaceholderText("영상을 창에 드롭하거나 선택")
         choose_video = QPushButton("영상 선택..."); preview_video = QPushButton("영상 미리보기 실행")
         save_video = QPushButton("현재 설정으로 영상 라벨링 저장")
+        self.target_box_count = QSpinBox(); self.target_box_count.setRange(0,999); self.target_box_count.setValue(1)
+        self.pause_on_count_mismatch = QCheckBox("목표와 다르면 자동 일시정지")
+        self.pause_on_count_mismatch.setChecked(True)
         choose_video.clicked.connect(self.choose_video)
         preview_video.clicked.connect(lambda: self.start_video(False))
         save_video.clicked.connect(lambda: self.start_video(True))
         video_form.addRow("영상", self.video_path_edit); video_form.addRow("", choose_video)
+        video_form.addRow("현재 클래스 목표 수", self.target_box_count)
+        video_form.addRow("", self.pause_on_count_mismatch)
         video_form.addRow("", preview_video); video_form.addRow("", save_video)
 
         self.labeling_panel = QGroupBox("데이터셋 / 라벨 저장"); data_form = QFormLayout(self.labeling_panel)
@@ -571,15 +576,24 @@ class MainWindow(QMainWindow):
                         cv2.FONT_HERSHEY_SIMPLEX,.6,(0,255,0),2)
         self.mask_view.show_mask(mask); self.original_view.show_bgr(preview)
         self.box_count_label.setText(f"{len(self.boxes)}개")
+        count_mismatch = (self.source_mode == "video" and
+                          not self.video_saving and
+                          self.pause_on_count_mismatch.isChecked() and
+                          len(self.boxes) != self.target_box_count.value())
+        if count_mismatch and not paused_refresh:
+            self.video_paused = True; self.play_button.setText("▶ 재생")
         camera_save = self.source_mode == "camera" and self.auto_save.isChecked()
         video_save = self.source_mode == "video" and self.video_saving
         if not paused_refresh:
             self.frame_count += 1
-            if (camera_save or video_save) and self.frame_count % self.interval.value() == 0:
+            if not count_mismatch and (camera_save or video_save) and self.frame_count % self.interval.value() == 0:
                 self.save_sample(automatic=True)
         source = (f"카메라 {self.camera_combo.currentText()}" if self.source_mode == "camera"
                   else f"영상 {self.video_path.name} | {self.frame_count} 프레임")
-        state = " | 저장 중" if video_save else ""
+        if count_mismatch:
+            state = f" | 목표 {self.target_box_count.value()}개 불일치 — 일시정지"
+        else:
+            state = " | 저장 중" if video_save else ""
         self.status.setText(f"{source}{state} | 박스 {len(self.boxes)}개\n저장: {self.dataset_dir}")
 
     @staticmethod
