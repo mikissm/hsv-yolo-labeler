@@ -2,5 +2,7 @@
 __pycache__/
 *.py[cod]
 dataset/
+*_aug/
+*_aug_[0-9]*/
 core
 core.*

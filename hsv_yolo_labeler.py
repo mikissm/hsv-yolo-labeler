@@ -142,6 +142,7 @@ class ReviewDialog(QDialog):
                                  for image in (dataset_dir/split/"images").glob("*"))
         self.images = self.all_images[:]
         self.index = 0; self.filter_class = None
+        self.trash_session=dataset_dir/".trash"/datetime.now().strftime("review_%Y%m%d_%H%M%S_%f")
         self.setWindowTitle("YOLO 라벨 검수"); self.resize(1100, 760)
         layout = QVBoxLayout(self); self.info = QLabel(); self.info.setAlignment(Qt.AlignCenter)
         self.preview = Preview("저장된 이미지가 없습니다")
@@ -156,10 +157,13 @@ class ReviewDialog(QDialog):
         row = QHBoxLayout(); previous = QPushButton("◀ 이전"); following = QPushButton("다음 ▶")
         self.class_combo = QComboBox(); self.class_combo.addItems(class_names)
         apply_button = QPushButton("현재 이미지의 모든 박스에 클래스 적용")
+        delete_button = QPushButton("현재 이미지 삭제")
         previous.clicked.connect(lambda: self.move(-1)); following.clicked.connect(lambda: self.move(1))
         apply_button.clicked.connect(self.apply_class)
+        delete_button.clicked.connect(self.delete_current_image)
         row.addWidget(previous); row.addWidget(following); row.addStretch()
         row.addWidget(QLabel("클래스 지정")); row.addWidget(self.class_combo); row.addWidget(apply_button)
+        row.addWidget(delete_button)
         layout.addLayout(row)
         self.previous_shortcut = QShortcut(QKeySequence(Qt.Key_Left), self)
         self.next_shortcut = QShortcut(QKeySequence(Qt.Key_Right), self)
@@ -218,6 +222,29 @@ class ReviewDialog(QDialog):
         path=self.images[self.index]; labels=self.read_labels(path); class_id=self.class_combo.currentIndex()
         lines=[f"{class_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}" for _,cx,cy,bw,bh in labels]
         self.label_path(path).write_text("\n".join(lines),encoding="utf-8"); self.show_current()
+
+    def delete_current_image(self):
+        if not self.images: return
+        image=self.images[self.index]; label=self.label_path(image)
+        answer=QMessageBox.question(self,"현재 이미지 삭제",
+            f"{image.name}\n\n이미지와 라벨을 복구 가능한 휴지통으로 이동할까요?",
+            QMessageBox.Yes|QMessageBox.No,QMessageBox.No)
+        if answer!=QMessageBox.Yes: return
+        split=image.parent.parent.name
+        image_target=self.trash_session/split/"images"/image.name
+        label_target=self.trash_session/split/"labels"/label.name
+        try:
+            image_target.parent.mkdir(parents=True,exist_ok=True); label_target.parent.mkdir(parents=True,exist_ok=True)
+            shutil.move(str(image),str(image_target))
+            if label.exists(): shutil.move(str(label),str(label_target))
+        except Exception as error:
+            QMessageBox.critical(self,"이동 중 오류",
+                f"파일을 완전히 이동하지 못했습니다. 다음 위치에서 복구 상태를 확인하세요.\n"
+                f"{self.trash_session}\n\n{error}")
+            self.all_images=[path for path in self.all_images if path.exists()]
+            self.change_filter(); return
+        self.all_images=[path for path in self.all_images if path!=image]
+        self.change_filter()
 
 
 class DataInfoDialog(QDialog):
@@ -533,14 +560,15 @@ class MainWindow(QMainWindow):
         split_form.addRow("",split_buttons); review_layout.addWidget(split_group)
         self.review_summary = QLabel("데이터 통계를 불러오는 중...")
         self.review_summary.setStyleSheet("font-size:18px;font-weight:bold;padding:8px")
-        self.review_table = QTableWidget(0,4)
-        self.review_table.setHorizontalHeaderLabels(("색상","클래스","박스 개수","검수"))
+        self.review_table = QTableWidget(0,5)
+        self.review_table.setHorizontalHeaderLabels(("색상","클래스","박스 개수","검수","이미지 삭제"))
         self.review_table.verticalHeader().setVisible(False); self.review_table.setAlternatingRowColors(True)
         self.review_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.review_table.horizontalHeader().setSectionResizeMode(0,QHeaderView.ResizeToContents)
         self.review_table.horizontalHeader().setSectionResizeMode(1,QHeaderView.Stretch)
         self.review_table.horizontalHeader().setSectionResizeMode(2,QHeaderView.ResizeToContents)
         self.review_table.horizontalHeader().setSectionResizeMode(3,QHeaderView.ResizeToContents)
+        self.review_table.horizontalHeader().setSectionResizeMode(4,QHeaderView.ResizeToContents)
         refresh_info = QPushButton("통계 새로고침")
         refresh_info.clicked.connect(self.refresh_review_table)
         review_sections=QTabWidget(); stats_page=QWidget(); stats_layout=QVBoxLayout(stats_page)
@@ -998,7 +1026,43 @@ class MainWindow(QMainWindow):
             self.review_table.setItem(class_id,2,count)
             button=QPushButton("클래스 검수")
             button.clicked.connect(lambda _,cid=class_id:self.open_review(cid))
-            self.review_table.setCellWidget(class_id,3,button); self.review_table.setRowHeight(class_id,42)
+            self.review_table.setCellWidget(class_id,3,button)
+            delete=QPushButton("해당 이미지 삭제")
+            delete.clicked.connect(lambda _,cid=class_id:self.delete_images_by_class(cid))
+            self.review_table.setCellWidget(class_id,4,delete); self.review_table.setRowHeight(class_id,42)
+
+    def images_containing_class(self,class_id):
+        matches=[]
+        for image,label,counts in self.dataset_items():
+            if class_id<len(counts) and counts[class_id]>0: matches.append((image,label))
+        return matches
+
+    def delete_images_by_class(self,class_id):
+        if not 0<=class_id<len(self.class_names): return
+        matches=self.images_containing_class(class_id)
+        if not matches:
+            QMessageBox.information(self,"삭제할 이미지 없음",f"'{self.class_names[class_id]}' 클래스가 포함된 이미지가 없습니다."); return
+        answer=QMessageBox.question(self,"클래스 이미지 삭제",
+            f"'{self.class_names[class_id]}' 클래스가 포함된 이미지 {len(matches):,}장을 휴지통으로 이동할까요?\n\n"
+            "여러 클래스가 함께 있는 이미지는 이미지 전체와 모든 라벨이 같이 이동합니다.",
+            QMessageBox.Yes|QMessageBox.No,QMessageBox.No)
+        if answer!=QMessageBox.Yes: return
+        trash=self.dataset_dir/".trash"/datetime.now().strftime(f"class_{class_id}_%Y%m%d_%H%M%S_%f")
+        moved=0
+        try:
+            for image,label in matches:
+                split=image.parent.parent.name
+                image_target=trash/split/"images"/image.name; label_target=trash/split/"labels"/label.name
+                image_target.parent.mkdir(parents=True,exist_ok=True); label_target.parent.mkdir(parents=True,exist_ok=True)
+                shutil.move(str(image),str(image_target))
+                if label.exists(): shutil.move(str(label),str(label_target))
+                moved+=1
+        except Exception as error:
+            QMessageBox.critical(self,"이동 중 오류",
+                f"{moved}장 이동 후 오류가 발생했습니다. 이동된 파일은 다음 위치에 있습니다.\n{trash}\n\n{error}")
+            self.refresh_review_table(); return
+        self.refresh_review_table()
+        QMessageBox.information(self,"이동 완료",f"{moved:,}장을 휴지통으로 이동했습니다.\n{trash}")
 
     def scan_dataset_errors(self):
         if self.error_scan_running: return
@@ -1411,6 +1475,7 @@ class MainWindow(QMainWindow):
     def open_review(self, class_id=None):
         self.ensure_dataset()
         ReviewDialog(self.dataset_dir,self.class_names,self,initial_class=class_id).exec_()
+        self.refresh_review_table()
 
     def save_sample(self, checked=False, automatic=False):
         if self.frame is None:
