@@ -25,6 +25,7 @@ import cv2
 import numpy as np
 
 DEFAULTS = (170, 10, 100, 255, 100, 255, 500, 5)
+HSV_DEFAULTS = DEFAULTS[:6]
 
 
 def parse_args():
@@ -114,7 +115,7 @@ class ValueControl(QWidget):
 class Preview(QLabel):
     def __init__(self, text):
         super().__init__(text); self._image = None
-        self.setAlignment(Qt.AlignCenter); self.setMinimumSize(400, 400)
+        self.setAlignment(Qt.AlignCenter); self.setMinimumSize(140, 160)
         self.setStyleSheet("background:black;color:white;border:1px solid #777")
 
     def show_bgr(self, image):
@@ -421,6 +422,9 @@ class MainWindow(QMainWindow):
         super().__init__(); self.args = args; self.capture = None
         self.frame, self.last_raw_frame, self.boxes = None, None, []
         self.last_move_hue = 170
+        self.hsv_ranges = [HSV_DEFAULTS]
+        self.active_hsv_range = 0
+        self.loading_hsv_range = False
         self.dataset_dir = args.output.expanduser()
         self.class_names = ["object"]
         self.frame_count = 0
@@ -430,13 +434,13 @@ class MainWindow(QMainWindow):
         self.video_paused = False
         self.video_ended = False
         self.rotation = 0
-        self.setWindowTitle("HSV YOLO Label Tool"); self.resize(1480, 880)
+        self.setWindowTitle("HSV YOLO Label Tool"); self.resize(1280, 800)
         self.setAcceptDrops(True)
         self.make_menu()
         root = QWidget(); outer = QHBoxLayout(root)
         self.controls_scroll = QScrollArea(); self.controls_scroll.setWidgetResizable(True)
         self.controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.controls_scroll.setMinimumWidth(430); self.controls_scroll.setMaximumWidth(430)
+        self.controls_scroll.setMinimumWidth(330); self.controls_scroll.setMaximumWidth(390)
         self.controls_scroll.setWidget(self.make_controls())
         outer.addWidget(self.controls_scroll)
         self.preview_panel = QWidget(); right = QVBoxLayout(self.preview_panel); views = QHBoxLayout()
@@ -663,6 +667,16 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.workflow_tabs)
         layout.addWidget(self.labeling_panel)
         self.workflow_tabs.currentChanged.connect(self.change_workflow_tab)
+        ranges = QGroupBox("HSV 범위 목록"); self.hsv_ranges_panel=ranges; ranges_box=QVBoxLayout(ranges)
+        self.hsv_range_combo=QComboBox(); add_range=QPushButton("+ 추가"); remove_range=QPushButton("삭제")
+        self.hsv_range_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.hsv_range_combo.setMinimumContentsLength(18)
+        self.hsv_range_combo.addItem("")
+        add_range.clicked.connect(self.add_hsv_range); remove_range.clicked.connect(self.remove_hsv_range)
+        self.add_hsv_range_button=add_range; self.remove_hsv_range_button=remove_range
+        range_buttons=QHBoxLayout(); range_buttons.addWidget(add_range); range_buttons.addWidget(remove_range)
+        ranges_box.addWidget(self.hsv_range_combo); ranges_box.addLayout(range_buttons)
+        layout.addWidget(ranges)
         hue = QGroupBox("Hue 범위 (원형)"); self.hue_panel=hue; hue_box = QVBoxLayout(hue)
         self.ring = HueRing(); hue_box.addWidget(self.ring)
         hue_form = QFormLayout(); self.start_h = ValueControl(0,179,170); self.end_h = ValueControl(0,179,10)
@@ -680,8 +694,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(sv)
         filters = QGroupBox("바운딩 박스 필터"); self.filter_panel=filters; filter_form = QFormLayout(filters)
         self.min_area = ValueControl(0,100000,500); self.kernel = ValueControl(1,31,5)
+        self.merge_boxes = QCheckBox("겹치거나 맞닿은 박스 OR 병합")
+        self.merge_boxes.setToolTip("여러 검출 박스의 합집합을 감싸는 하나의 박스로 만듭니다")
         self.remove_nested = QCheckBox("큰 박스 안의 작은 박스 제거")
         filter_form.addRow("최소 면적",self.min_area); filter_form.addRow("노이즈 제거",self.kernel)
+        filter_form.addRow("", self.merge_boxes)
         filter_form.addRow("", self.remove_nested)
         layout.addWidget(filters)
         self.action_panel=QWidget(); buttons = QHBoxLayout(self.action_panel)
@@ -696,6 +713,9 @@ class MainWindow(QMainWindow):
         self.move_h.slider.valueChanged.connect(self.move_hue_range)
         for control in (self.start_h,self.end_h,self.s_low,self.s_high,self.v_low,self.v_high):
             control.slider.valueChanged.connect(self.update_spectrum)
+            control.slider.valueChanged.connect(self.save_active_hsv_range)
+        self.hsv_range_combo.currentIndexChanged.connect(self.select_hsv_range)
+        self.refresh_hsv_range_list()
         self.camera_combo.currentTextChanged.connect(lambda text: self.open_camera(int(text)))
         self.update_augmentation_estimate()
         return panel
@@ -706,7 +726,62 @@ class MainWindow(QMainWindow):
         self.sv_spectrum.set_range(self.start_h.value(), self.s_low.value(),
             self.s_high.value(), self.v_low.value(), self.v_high.value())
 
+    def current_hsv_values(self):
+        return (self.start_h.value(),self.end_h.value(),self.s_low.value(),
+                self.s_high.value(),self.v_low.value(),self.v_high.value())
+
+    @staticmethod
+    def hsv_range_name(index, values):
+        start_h,end_h,s_low,s_high,v_low,v_high=values
+        return (f"HSV {index+1} | H {start_h}→{end_h}  "
+                f"S {s_low}–{s_high}  V {v_low}–{v_high}")
+
+    def refresh_hsv_range_list(self):
+        self.hsv_range_combo.blockSignals(True)
+        while self.hsv_range_combo.count()<len(self.hsv_ranges): self.hsv_range_combo.addItem("")
+        while self.hsv_range_combo.count()>len(self.hsv_ranges): self.hsv_range_combo.removeItem(self.hsv_range_combo.count()-1)
+        for index,values in enumerate(self.hsv_ranges):
+            self.hsv_range_combo.setItemText(index,self.hsv_range_name(index,values))
+        self.hsv_range_combo.setCurrentIndex(self.active_hsv_range)
+        self.hsv_range_combo.blockSignals(False)
+        self.remove_hsv_range_button.setEnabled(len(self.hsv_ranges)>1)
+
+    def save_active_hsv_range(self,*_):
+        if self.loading_hsv_range or not self.hsv_ranges: return
+        self.hsv_ranges[self.active_hsv_range]=self.current_hsv_values()
+        self.refresh_hsv_range_list()
+
+    def load_hsv_range(self,index):
+        self.loading_hsv_range=True
+        try:
+            controls=(self.start_h,self.end_h,self.s_low,self.s_high,self.v_low,self.v_high)
+            for control,value in zip(controls,self.hsv_ranges[index]): control.setValue(value)
+            self.last_move_hue=self.start_h.value(); self.move_h.setValue(self.last_move_hue)
+        finally:
+            self.loading_hsv_range=False
+        self.update_ring(); self.update_spectrum()
+
+    def select_hsv_range(self,index):
+        if index<0 or index>=len(self.hsv_ranges): return
+        self.active_hsv_range=index; self.load_hsv_range(index)
+
+    def add_hsv_range(self):
+        self.save_active_hsv_range()
+        self.hsv_ranges.append(self.current_hsv_values())
+        self.active_hsv_range=len(self.hsv_ranges)-1
+        self.refresh_hsv_range_list(); self.load_hsv_range(self.active_hsv_range)
+        self.status.setText(f"HSV 범위 {len(self.hsv_ranges)} 추가됨 — 값을 조절하세요")
+
+    def remove_hsv_range(self):
+        if len(self.hsv_ranges)<=1: return
+        removed=self.active_hsv_range+1
+        del self.hsv_ranges[self.active_hsv_range]
+        self.active_hsv_range=min(self.active_hsv_range,len(self.hsv_ranges)-1)
+        self.refresh_hsv_range_list(); self.load_hsv_range(self.active_hsv_range)
+        self.status.setText(f"HSV 범위 {removed} 삭제됨")
+
     def move_hue_range(self, value):
+        if self.loading_hsv_range: return
         delta = (value - self.last_move_hue + 180) % 180
         if delta > 90: delta -= 180
         self.last_move_hue = value
@@ -805,12 +880,15 @@ class MainWindow(QMainWindow):
 
     def make_mask(self, frame):
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        sv = cv2.inRange(hsv, np.array([0,self.s_low.value(),self.v_low.value()],np.uint8),
-                         np.array([179,self.s_high.value(),self.v_high.value()],np.uint8))
-        h, start, end = hsv[:,:,0], self.start_h.value(), self.end_h.value()
-        hue = cv2.inRange(h,start,end) if start <= end else cv2.bitwise_or(
-            cv2.inRange(h,start,179),cv2.inRange(h,0,end))
-        mask = cv2.bitwise_and(sv,hue); size = self.kernel.value() | 1
+        mask = np.zeros(hsv.shape[:2],np.uint8)
+        h=hsv[:,:,0]
+        for start,end,s_low,s_high,v_low,v_high in self.hsv_ranges:
+            sv = cv2.inRange(hsv,np.array([0,s_low,v_low],np.uint8),
+                             np.array([179,s_high,v_high],np.uint8))
+            hue = cv2.inRange(h,start,end) if start<=end else cv2.bitwise_or(
+                cv2.inRange(h,start,179),cv2.inRange(h,0,end))
+            mask=cv2.bitwise_or(mask,cv2.bitwise_and(sv,hue))
+        size = self.kernel.value() | 1
         kernel = np.ones((size,size),np.uint8)
         return cv2.morphologyEx(cv2.morphologyEx(mask,cv2.MORPH_OPEN,kernel),
                                 cv2.MORPH_CLOSE,kernel)
@@ -842,6 +920,8 @@ class MainWindow(QMainWindow):
         contours,_ = cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
         self.boxes = sorted([cv2.boundingRect(c) for c in contours
                              if cv2.contourArea(c)>=self.min_area.value()])
+        if self.merge_boxes.isChecked():
+            self.boxes = self.merge_overlapping_boxes(self.boxes)
         if self.remove_nested.isChecked():
             self.boxes = self.without_nested_boxes(self.boxes)
         preview = frame.copy()
@@ -870,6 +950,25 @@ class MainWindow(QMainWindow):
         else:
             state = " | 저장 중" if video_save else ""
         self.status.setText(f"{source}{state} | 박스 {len(self.boxes)}개\n저장: {self.dataset_dir}")
+
+    @staticmethod
+    def merge_overlapping_boxes(boxes):
+        pending=list(boxes); merged=[]
+        while pending:
+            x,y,w,h=pending.pop(0)
+            changed=True
+            while changed:
+                changed=False
+                x2,y2=x+w,y+h
+                for index,(ox,oy,ow,oh) in enumerate(pending):
+                    ox2,oy2=ox+ow,oy+oh
+                    if x<=ox2 and ox<=x2 and y<=oy2 and oy<=y2:
+                        nx,ny=min(x,ox),min(y,oy)
+                        x2,y2=max(x2,ox2),max(y2,oy2)
+                        x,y,w,h=nx,ny,x2-nx,y2-ny
+                        pending.pop(index); changed=True; break
+            merged.append((x,y,w,h))
+        return sorted(merged)
 
     @staticmethod
     def without_nested_boxes(boxes):
@@ -996,7 +1095,7 @@ class MainWindow(QMainWindow):
     def change_workflow_tab(self, index):
         full_page = index in (2,3)
         self.preview_panel.setVisible(not full_page)
-        for panel in (self.labeling_panel,self.hue_panel,self.sv_panel,self.filter_panel,
+        for panel in (self.labeling_panel,self.hsv_ranges_panel,self.hue_panel,self.sv_panel,self.filter_panel,
                       self.action_panel,self.status):
             panel.setVisible(not full_page)
         self.main_title.setText(("데이터셋 검수" if index==2 else "데이터 증강") if full_page else "HSV → YOLO")
@@ -1007,7 +1106,7 @@ class MainWindow(QMainWindow):
             if index==2: self.refresh_review_table()
             else: self.update_augmentation_estimate()
         else:
-            self.controls_scroll.setMinimumWidth(430); self.controls_scroll.setMaximumWidth(430)
+            self.controls_scroll.setMinimumWidth(330); self.controls_scroll.setMaximumWidth(390)
             self.workflow_tabs.setSizePolicy(QSizePolicy.Ignored,QSizePolicy.Preferred)
             page_height=self.workflow_tabs.widget(index).sizeHint().height()+42
             self.workflow_tabs.setMinimumHeight(page_height); self.workflow_tabs.setMaximumHeight(page_height)
@@ -1492,9 +1591,14 @@ class MainWindow(QMainWindow):
         self.status.setText(f"저장 완료: {image_path.name} ({len(lines)} boxes)")
 
     def reset_defaults(self):
-        controls=(self.start_h,self.end_h,self.s_low,self.s_high,self.v_low,self.v_high,self.min_area,self.kernel)
-        for control,value in zip(controls,DEFAULTS): control.setValue(value)
+        self.hsv_ranges=[HSV_DEFAULTS]; self.active_hsv_range=0
+        controls=(self.start_h,self.end_h,self.s_low,self.s_high,self.v_low,self.v_high)
+        self.loading_hsv_range=True
+        for control,value in zip(controls,HSV_DEFAULTS): control.setValue(value)
+        self.loading_hsv_range=False
+        for control,value in zip((self.min_area,self.kernel),DEFAULTS[6:]): control.setValue(value)
         self.last_move_hue = 170; self.move_h.setValue(170)
+        self.refresh_hsv_range_list(); self.update_ring(); self.update_spectrum()
 
     def keyPressEvent(self,event):
         if event.key()==Qt.Key_S: self.save_sample()
@@ -1511,8 +1615,9 @@ def main():
     args=parse_args(); app=QApplication(sys.argv); app.setStyle("Fusion")
     window=MainWindow(args)
     available=app.primaryScreen().availableGeometry()
-    window.resize(min(1480,max(900,available.width()-40)),
-                  min(880,max(650,available.height()-60)))
+    available_width=max(640,available.width()-40)
+    available_height=max(480,available.height()-60)
+    window.resize(min(1280,available_width),min(800,available_height))
     window.move(available.x()+(available.width()-window.width())//2,
                 available.y()+(available.height()-window.height())//2)
     window.show(); return app.exec_()
